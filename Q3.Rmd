@@ -1,0 +1,323 @@
+---
+title: "Q3. Machine learning to predict GVHD from sequential pre- and post-transplant TCR-β (TCR-beta) targeted sequencing"
+author: "Your Name"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+fontsize: 11pt
+---
+
+## Purpose
+
+**Question.** What machine learning (ML) tools can predict whether a patient will develop graft-versus-host disease (GVHD) using **sequential samples** collected **before and after** transplant with **TCR-$\beta$ targeted sequencing**? How should such a model be developed, and what problems are expected?
+
+**Summary.** Simple, robust ML methods that perform well on modest clinical cohorts are suitable, such as **logistic regression** (or a shallow decision tree / random forest). Features should be derived from early post-transplant repertoire metrics (for example day +30). In Leick *et al.* (2020), a **higher number of expanded clones at day +30** was associated with later **acute GVHD**, and repertoire turnover slowed by approximately **day +50**, implying that earlier time points carry greater predictive information. The simulation below mirrors these ideas and demonstrates a baseline classifier with clear, interpretable steps.
+
+## Modeling plan (simple and practical)
+
+1. **Define the prediction target and the time of prediction.**  
+   - Target: **Acute GVHD by day +100** (yes/no).  
+   - Landmark: compute features **available by day +30** to avoid using future data.
+
+2. **Engineer features from TCR-seq (per patient, per time point).**  
+   - **Clonality**: degree to which the repertoire is dominated by a few clones (higher = more dominance).  
+   - **Top-3 cumulative frequency**: sum of the three largest clone proportions.  
+   - **Morisita–Horn similarity to donor**: similarity of the recipient repertoire to the donor baseline (0 = different, 1 = very similar).  
+   - **Number of expanded clones vs donor**: count of clones significantly larger than donor baseline using a simple binomial test with FDR adjustment.  
+   - Optional: **T-cell fraction**, V-gene usage, and simple change-over-time features if multiple post-transplant samples are available.
+
+3. **Add basic clinical covariates** to reduce confounding (for example: age, donor type such as MRD/MUD/MMUD, conditioning intensity, ATG prophylaxis).
+
+4. **Choose a straightforward model and evaluate honestly.**  
+   - Begin with **logistic regression** (interpretable, stable for small datasets).  
+   - Split at the **patient** level into train/test sets.  
+   - Report accuracy and a simple AUC.  
+   - As an extension, consider a small **decision tree** or **random forest** for nonlinearities and interactions.
+
+5. **Anticipated problems.**  
+   - **Data leakage:** do not use samples collected after the prediction time (for example, avoid using day +50 to predict day +100 when the landmark is day +30).  
+   - **Small N / high dimensionality:** favor simple models and regularization.  
+   - **Multiple testing:** adjust p-values (FDR) when calling expanded clones.  
+   - **Compositional data and over-dispersion:** compute features on frequencies, not raw counts; note that real variability can exceed binomial assumptions.  
+   - **Batch/center effects:** track and adjust if present.  
+   - **Time-to-event nuances:** for onset time with censoring/competing risks, use survival methods (for example, Cox model or Random Survival Forests) instead of a simple 0/1 endpoint.
+
+> **Rationale for the day +30 landmark.** Leick *et al.* (2020) observed that **increased clonal expansion at day +30** preceded acute GVHD and that repertoire **turnover slowed by ~day +50**, indicating that earlier features are more informative.
+
+## Simulation and baseline model (fully self-contained R code)
+
+The code below **simulates** donor and post-transplant TCR-$\beta$counts for multiple patients. In the simulation, patients who develop GVHD show a **burst of clonal expansion at day +30**. Simple features are computed and a **logistic regression** is fit using the **day +30** landmark. 
+
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+
+
+# GVHD prediction from sequential TCR-seq: simple simulation
+
+
+set.seed(999)
+
+# 1. Basic settings for the simulation 
+n_patients   <- 60                        # number of patients
+timepoints   <- c("donor","d15","d30","d50","d100")
+n_clones     <- 200                       # number of clonotypes tracked
+gvhd_rate    <- 0.35                      # ~35% will develop aGVHD (toy)
+
+# Simple clinical covariates
+# Age: numeric; DonorType and ATG: categorical
+# Match Related Donor (MRD); Match Unrelated Donor (MUD); 
+# Mismatched Unrealted Donor (MMUD)
+age_vec      <- round(rnorm(n_patients, mean = 50, sd = 12))
+donor_types  <- sample(c("MRD","MUD","MMUD"), n_patients, replace = TRUE,
+                       prob = c(0.45,0.45,0.10))
+atg_vec      <- sample(c("Yes","No"), n_patients, replace = TRUE, 
+                       prob = c(0.4,0.6))
+
+# True label we want to predict
+gvhd_label   <- rbinom(n_patients, size = 1, prob = gvhd_rate)
+
+# 2. Helper functions
+
+# Turn a numeric vector into a probability vector (sums to 1)
+to_prob <- function(x) {
+  s <- sum(x)
+  if (s == 0) return(rep(0, length(x)))
+  x / s
+}
+
+# Shannon diversity (higher = more evenness/variety)
+shannon <- function(p) {
+  p <- p[p > 0]
+  -sum(p * log(p))
+}
+
+# Clonality (0..1): 1 = very dominated by a few clones; 0 = very even
+# Here we use a simple normalized Shannon: clonality = 1 - H / log(K)
+clonality <- function(p) {
+  k <- sum(p > 0)
+  if (k <= 1) return(1)
+  1 - (shannon(p) / log(k))
+}
+
+# Morisita–Horn similarity between two frequency vectors p and q (0..1)
+morisita_horn <- function(p, q) {
+  num  <- 2 * sum(p * q)
+  den  <- sum(p * p) + sum(q * q)
+  if (den == 0) return(0)
+  num / den
+}
+
+# Two-sided binomial p-value for "is x out of n higher/lower than expected p?"
+binom_p_two_sided <- function(x, n, p) {
+  # Lower tail and upper tail probabilities
+  lower <- pbinom(x, n, p)
+  upper <- 1 - pbinom(x - 1, n, p)
+  pv    <- 2 * min(lower, upper)
+  if (pv > 1) pv <- 1
+  pv
+}
+
+# 3. Simulate donor repertoire for every patient 
+# We draw donor frequencies from a Dirichlet-like scheme by using 
+# rgamma and normalizing.
+# (rgamma is simple; dividing by the sum turns it into a probability vector.)
+donor_freqs <- matrix(0, nrow = n_patients, ncol = n_clones)
+for (i in 1:n_patients) {
+  base <- rgamma(n_clones, shape = 1, rate = 1) # many small clones, 
+                                                # a few bigger
+  donor_freqs[i, ] <- to_prob(base)
+}
+
+# 4. Simulate post-transplant counts at each timepoint
+# We simulate counts by drawing from a multinomial with total 
+# "T-cell templates".
+# We enforce biology:
+# - Early after HCT (day +15), repertoires are noisy/different from donor.
+# - At day +30, GVHD patients have extra growth of a handful of clones 
+# i.e., ("expansion").
+# - By day +50 and +100, turnover slows (repertoires change less).
+
+# For simplicity we use simple multipliers and then renormalize.
+
+# Store counts in a list: counts[[tp]][[patient]] = integer vector
+# of length n_clones
+counts <- list()
+for (tp in timepoints) counts[[tp]] <- vector("list", n_patients)
+
+for (i in 1:n_patients) {
+  donor_p <- donor_freqs[i, ]
+  # Number of T-cell templates captured per sample (toy numbers)
+  totals  <- c(donor = 6000, d15 = 5000, d30 = 5500, d50 = 5200, d100 = 5300)
+  
+  # DONOR: draw counts from donor frequencies
+  counts[["donor"]][[i]] <- as.vector(rmultinom(1, size = totals["donor"], 
+                                                prob = donor_p))
+  
+  # DAY +15: add noise (different from donor), representing early 
+  # reconstitution
+  # We draw a new vector centered loosely on donor_p
+  d15_base <- rgamma(n_clones, shape = 40 * donor_p + 0.1, rate = 1)
+  d15_p    <- to_prob(d15_base)
+  counts[["d15"]][[i]] <- as.vector(rmultinom(1, size = totals["d15"], 
+                                              prob = d15_p))
+  
+  # DAY +30: key signal. If GVHD = 1, expand ~10 clones strongly; otherwise
+  # mild drift.
+  d30_base <- rgamma(n_clones, shape = 60 * donor_p + 0.1, rate = 1)
+  # For GVHD patients, pick 10 random clones and boost them
+  if (gvhd_label[i] == 1) {
+    idx <- sample(1:n_clones, size = 10)
+    d30_base[idx] <- d30_base[idx] * 8  # strong expansion
+  } else {
+    # Non-GVHD: mild unevenness only
+    idx <- sample(1:n_clones, size = 5)
+    d30_base[idx] <- d30_base[idx] * 2
+  }
+  d30_p <- to_prob(d30_base)
+  counts[["d30"]][[i]] <- as.vector(rmultinom(1, size = totals["d30"], 
+                                              prob = d30_p))
+  
+  # DAY +50: turnover slows; stay close to day +30
+  d50_base <- rgamma(n_clones, shape = 200 * d30_p + 0.1, rate = 1)
+  d50_p    <- to_prob(d50_base)
+  counts[["d50"]][[i]] <- as.vector(rmultinom(1, size = totals["d50"],
+                                              prob = d50_p))
+  
+  # DAY +100: similar to day +50 (stasis)
+  d100_base <- rgamma(n_clones, shape = 200 * d50_p + 0.1, rate = 1)
+  d100_p    <- to_prob(d100_base)
+  counts[["d100"]][[i]] <- as.vector(rmultinom(1, size = totals["d100"], 
+                                               prob = d100_p))
+}
+
+# 5. Compute simple repertoire features per patient/timepoint
+# For each sample we compute:
+# - frequencies p
+# - Shannon diversity and clonality
+# - top3 cumulative frequency
+# - Morisita–Horn similarity to donor
+# - number of "expanded clones" vs donor (binomial + BH, with a small fold-change filter)
+
+feature_rows <- list()
+
+for (i in 1:n_patients) {
+  donor_cnt <- counts[["donor"]][[i]]
+  donor_n   <- sum(donor_cnt)
+  donor_p   <- donor_cnt / donor_n
+  
+  for (tp in timepoints) {
+    x <- counts[[tp]][[i]]
+    n <- sum(x)
+    p <- x / n
+    
+    # Shannon, clonality, top3
+    H        <- shannon(p)
+    clono    <- clonality(p)
+    top3     <- sum(sort(p, decreasing = TRUE)[1:3])
+    
+    # Morisita to donor (donor vs donor = 1.0 by definition)
+    morisita <- morisita_horn(donor_p, p)
+    
+    # Expanded clones vs donor using binomial test
+    # H0: recipient proportion equals donor proportion (p_donor)
+    # two-sided; count only those that are significantly HIGHER and at least 2x donor fraction
+    pv <- numeric(n_clones)
+    for (j in 1:n_clones) {
+      p0 <- donor_p[j]
+      xj <- x[j]
+      if (p0 == 0) {
+        # if donor had zero, we can't define a binomial p under H0; treat as not expanded
+        pv[j] <- 1
+      } else {
+        pv[j] <- binom_p_two_sided(xj, n, p0)
+      }
+    }
+    # Adjust for multiple tests (Benjamini–Hochberg)
+    pv_adj <- p.adjust(pv, method = "BH")
+    # fold-change
+    fc     <- ifelse(donor_p > 0, (p / donor_p), 0)
+    expanded <- sum((p > donor_p) & (fc >= 2) & (pv_adj < 0.05))
+    
+    # Save a row
+    feature_rows[[length(feature_rows) + 1]] <- data.frame(
+      PatientID = i,
+      Timepoint = tp,
+      Shannon   = H,
+      Clonality = clono,
+      Top3      = top3,
+      MorisitaToDonor = morisita,
+      ExpandedCount   = expanded,
+      TotalTemplates  = n
+    )
+  }
+}
+
+features <- do.call(rbind, feature_rows)
+
+# 6. Build a landmark dataset at day +30 (predict GVHD by +100)
+landmark <- subset(features, Timepoint == "d30")
+landmark$Age       <- age_vec[landmark$PatientID]
+landmark$DonorType <- donor_types[landmark$PatientID]
+landmark$ATG       <- atg_vec[landmark$PatientID]
+landmark$GVHD_100  <- gvhd_label[landmark$PatientID]
+
+cat("A peek at the feature table at day +30:\n")
+print(head(landmark, 3))
+
+# 7. Simple train/test split at the PATIENT level ####
+set.seed(123)
+train_ids <- sample(1:n_patients, size = round(0.7 * n_patients), 
+                    replace = FALSE)
+train_df  <- subset(landmark, PatientID %in% train_ids)
+test_df   <- subset(landmark, !(PatientID %in% train_ids))
+
+# 8. Fit a very simple logistic regression 
+# We use a few intuitive features and basic clinical covariates.
+fit <- glm(GVHD_100 ~ Clonality + Top3 + MorisitaToDonor + ExpandedCount +
+             Age + DonorType + ATG,
+           data = train_df, family = binomial())
+
+cat("Logistic regression summary (toy simulation)")
+print(summary(fit))
+
+# Simple odds ratios (exp(coef))
+cat("\nApproximate odds ratios (exp of coefficients):\n")
+print(exp(coef(fit)))
+
+# 9. Predict on the test set and evaluate ####
+test_prob <- predict(fit, newdata = test_df, type = "response")
+test_pred <- ifelse(test_prob >= 0.5, 1, 0)
+
+# Accuracy
+acc <- mean(test_pred == test_df$GVHD_100)
+cat("\nTest accuracy (threshold 0.5):", round(acc, 3), "\n")
+
+# A very simple AUC (manual, no extra packages):
+simple_auc <- function(y_true, y_prob) {
+  o <- order(y_prob, decreasing = TRUE)
+  y <- y_true[o]
+  # Compute TPR/FPR by sweeping thresholds at each unique score
+  P <- sum(y == 1); N <- sum(y == 0)
+  if (P == 0 || N == 0) return(NA)
+  tpr <- cumsum(y == 1) / P
+  fpr <- cumsum(y == 0) / N
+  # Trapezoid rule over the ROC curve
+  auc <- sum(diff(c(0, fpr)) * (head(c(0, tpr), -1) + tail(c(0, tpr), -1)) / 2)
+  auc
+}
+auc_val <- simple_auc(test_df$GVHD_100, test_prob)
+cat("Simple AUC:", round(auc_val, 3), "\n")
+
+# Show which features look important in this simple model
+coef_table <- data.frame(Variable = names(coef(fit)),
+                         Coef     = coef(fit),
+                         OddsRatio= exp(coef(fit)))
+cat("\nCoefficients (interpret sign and size; larger OR > 1 increases risk):\n")
+print(coef_table)
+
+
+```
+
+## Reference:
+
+Leick M, Gittelman RM, Yusko E, Sanders C, Robins H, DeFilipp Z, Nikiforow S, Ritz J, Chen Y-B. T Cell Clonal Dynamics Determined by High-Resolution TCR-$\beta$ Sequencing in Recipients after Allogeneic Hematopoietic Cell Transplantation. Biology of Blood and Marrow Transplantation 2020;26(9):1567–1574
